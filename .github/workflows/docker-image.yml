@@ -1,0 +1,96 @@
+name: Deploy to Azure VM (No Registry, Compose)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_DIR: /opt/apps/testing                 # change if you like
+  SSH_FINGERPRINT: "SHA256:ldzbAGbmoqDjpsrl6gn68O2jmClI+1la8cWpd6vDJbM"
+  PROJECT_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # keep upload smaller; your Docker build will still work
+      - name: Prune CI files from upload
+        run: rm -rf .git .github || true
+
+      - name: Prepare remote dir
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          fingerprint: ${{ env.SSH_FINGERPRINT }}
+          script: |
+            set -e
+            sudo mkdir -p "${{ env.APP_DIR }}"
+            sudo chown -R $USER:$USER "${{ env.APP_DIR }}"
+            rm -rf "${{ env.APP_DIR }}"/*
+
+      - name: Upload repo to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          fingerprint: ${{ env.SSH_FINGERPRINT }}
+          source: "."
+          target: "${{ env.APP_DIR }}"
+
+      - name: Build & start with Docker (Compose if present)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          fingerprint: ${{ env.SSH_FINGERPRINT }}
+          script_stop: true
+          script: |
+            set -e
+            # Install Docker if missing
+            if ! command -v docker >/dev/null 2>&1; then
+              curl -fsSL https://get.docker.com | sh
+              sudo systemctl enable --now docker
+            fi
+            # Ensure compose plugin
+            if ! docker compose version >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y docker-compose-plugin
+            fi
+
+            cd "${{ env.APP_DIR }}"
+
+            # If you keep an .env.example, auto-create .env the first time
+            [ -f .env ] || { [ -f .env.example ] && cp .env.example .env; } || true
+
+            if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
+              # Compose path
+              sudo docker compose -p "${{ env.PROJECT_NAME }}" down --remove-orphans
+              sudo docker compose -p "${{ env.PROJECT_NAME }}" up -d --build --remove-orphans
+            else
+              # Fallback: single Dockerfile build & run
+              SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+              APP_NAME="${{ secrets.APP_NAME }}"
+              PUB="${{ secrets.PUBLIC_PORT }}"
+              IN="${{ secrets.CONTAINER_PORT }}"
+              [ -n "$APP_NAME" ] && [ -n "$PUB" ] && [ -n "$IN" ] || { echo "Missing APP_NAME/PUBLIC_PORT/CONTAINER_PORT"; exit 1; }
+              sudo docker build -t "$APP_NAME:$SHORT_SHA" -t "$APP_NAME:latest" .
+              sudo docker rm -f "$APP_NAME" 2>/dev/null || true
+              sudo docker run -d --name "$APP_NAME" -p "$PUB:$IN" --restart=always "$APP_NAME:latest"
+            fi
+
+            sudo docker image prune -f
