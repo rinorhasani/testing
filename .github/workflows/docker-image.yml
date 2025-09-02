@@ -10,10 +10,12 @@ permissions:
 
 env:
   APP_DIR: /opt/apps/testing
+  PROJECT_NAME: ${{ github.event.repository.name }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,27 +29,31 @@ jobs:
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_vm
           chmod 600 ~/.ssh/id_vm
-          # pin all server keys (ed25519,rsa,ecdsa) into known_hosts
+          # Pin server keys into known_hosts (ed25519,rsa,ecdsa)
           ssh-keyscan -H -t ed25519,rsa,ecdsa "$SSH_HOST" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
-          # quick sanity print
           ssh-keygen -lf ~/.ssh/known_hosts || true
 
-      - name: Prepare remote dir
+      - name: Prepare remote dir (and ensure rsync)
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           ssh -i ~/.ssh/id_vm -p "${{ secrets.SSH_PORT || 22 }}" -o StrictHostKeyChecking=yes \
-            "$SSH_USER@$SSH_HOST" \
-            "sudo mkdir -p '${APP_DIR}' && sudo chown -R \$USER:\$USER '${APP_DIR}' && rm -rf '${APP_DIR}'/*"
+            "$SSH_USER@$SSH_HOST" "
+              set -e
+              sudo apt-get update -y >/dev/null 2>&1 || true
+              sudo apt-get install -y rsync >/dev/null 2>&1 || true
+              sudo mkdir -p '${APP_DIR}'
+              sudo chown -R \$USER:\$USER '${APP_DIR}'
+              rm -rf '${APP_DIR}'/*
+            "
 
       - name: Upload repo (rsync over SSH)
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
-          # keep upload small
           rm -rf .git .github || true
           rsync -az --delete -e "ssh -i ~/.ssh/id_vm -p ${{ secrets.SSH_PORT || 22 }} -o StrictHostKeyChecking=yes" \
             ./ "$SSH_USER@$SSH_HOST:${APP_DIR}/"
@@ -60,24 +66,35 @@ jobs:
           ssh -i ~/.ssh/id_vm -p "${{ secrets.SSH_PORT || 22 }}" -o StrictHostKeyChecking=yes \
             "$SSH_USER@$SSH_HOST" "
               set -e
+              # Install Docker if missing
               if ! command -v docker >/dev/null 2>&1; then
                 curl -fsSL https://get.docker.com | sh
                 sudo systemctl enable --now docker
               fi
-              if ! docker compose version >/dev/null 2>&1; then
-                sudo apt-get update -y && sudo apt-get install -y docker-compose-plugin
+              # Ensure compose plugin
+              if ! sudo docker compose version >/dev/null 2>&1; then
+                sudo apt-get update -y
+                sudo apt-get install -y docker-compose-plugin
               fi
+
               cd '${APP_DIR}'
               [ -f .env ] || { [ -f .env.example ] && cp .env.example .env; } || true
+
               if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-                docker compose -p testing down --remove-orphans
-                docker compose -p testing up -d --build --remove-orphans
+                # Use Compose (project name = repo name)
+                sudo docker compose -p '${PROJECT_NAME}' down --remove-orphans
+                sudo docker compose -p '${PROJECT_NAME}' up -d --build --remove-orphans
               else
-                # fallback single Dockerfile (requires APP_NAME/PUBLIC_PORT/CONTAINER_PORT secrets)
+                # Fallback: single Dockerfile (requires APP_NAME/PUBLIC_PORT/CONTAINER_PORT secrets)
                 SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-7)
-                docker build -t '${{ secrets.APP_NAME }}:'\"$SHORT_SHA\" -t '${{ secrets.APP_NAME }}:latest' .
-                docker rm -f '${{ secrets.APP_NAME }}' 2>/dev/null || true
-                docker run -d --name '${{ secrets.APP_NAME }}' -p '${{ secrets.PUBLIC_PORT }}:${{ secrets.CONTAINER_PORT }}' --restart=always '${{ secrets.APP_NAME }}:latest'
+                APP='${{ secrets.APP_NAME }}'
+                PUB='${{ secrets.PUBLIC_PORT }}'
+                INN='${{ secrets.CONTAINER_PORT }}'
+                [ -n \"$APP\" ] && [ -n \"$PUB\" ] && [ -n \"$INN\" ] || { echo 'Missing APP_NAME/PUBLIC_PORT/CONTAINER_PORT'; exit 1; }
+                sudo docker build -t \"$APP:$SHORT_SHA\" -t \"$APP:latest\" .
+                sudo docker rm -f \"$APP\" 2>/dev/null || true
+                sudo docker run -d --name \"$APP\" -p \"$PUB:$INN\" --restart=always \"$APP:latest\"
               fi
-              docker image prune -f
+
+              sudo docker image prune -f
             "
