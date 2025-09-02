@@ -1,4 +1,4 @@
-name: Deploy to Azure VM (No Registry, Compose)
+name: Deploy to Azure VM (OpenSSH, No Registry, Compose)
 
 on:
   push:
@@ -9,88 +9,75 @@ permissions:
   contents: read
 
 env:
-  APP_DIR: /opt/apps/testing                 # change if you like
-  SSH_FINGERPRINT: "SHA256:ldzbAGbmoqDjpsrl6gn68O2jmClI+1la8cWpd6vDJbM"
-  PROJECT_NAME: ${{ github.event.repository.name }}
+  APP_DIR: /opt/apps/testing
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # keep upload smaller; your Docker build will still work
-      - name: Prune CI files from upload
-        run: rm -rf .git .github || true
+      - name: Setup SSH key & known_hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY:  ${{ secrets.SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_vm
+          chmod 600 ~/.ssh/id_vm
+          # pin all server keys (ed25519,rsa,ecdsa) into known_hosts
+          ssh-keyscan -H -t ed25519,rsa,ecdsa "$SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          # quick sanity print
+          ssh-keygen -lf ~/.ssh/known_hosts || true
 
       - name: Prepare remote dir
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          fingerprint: ${{ env.SSH_FINGERPRINT }}
-          script: |
-            set -e
-            sudo mkdir -p "${{ env.APP_DIR }}"
-            sudo chown -R $USER:$USER "${{ env.APP_DIR }}"
-            rm -rf "${{ env.APP_DIR }}"/*
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -i ~/.ssh/id_vm -p "${{ secrets.SSH_PORT || 22 }}" -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" \
+            "sudo mkdir -p '${APP_DIR}' && sudo chown -R \$USER:\$USER '${APP_DIR}' && rm -rf '${APP_DIR}'/*"
 
-      - name: Upload repo to VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          fingerprint: ${{ env.SSH_FINGERPRINT }}
-          source: "."
-          target: "${{ env.APP_DIR }}"
+      - name: Upload repo (rsync over SSH)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          # keep upload small
+          rm -rf .git .github || true
+          rsync -az --delete -e "ssh -i ~/.ssh/id_vm -p ${{ secrets.SSH_PORT || 22 }} -o StrictHostKeyChecking=yes" \
+            ./ "$SSH_USER@$SSH_HOST:${APP_DIR}/"
 
-      - name: Build & start with Docker (Compose if present)
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          fingerprint: ${{ env.SSH_FINGERPRINT }}
-          script_stop: true
-          script: |
-            set -e
-            # Install Docker if missing
-            if ! command -v docker >/dev/null 2>&1; then
-              curl -fsSL https://get.docker.com | sh
-              sudo systemctl enable --now docker
-            fi
-            # Ensure compose plugin
-            if ! docker compose version >/dev/null 2>&1; then
-              sudo apt-get update -y
-              sudo apt-get install -y docker-compose-plugin
-            fi
-
-            cd "${{ env.APP_DIR }}"
-
-            # If you keep an .env.example, auto-create .env the first time
-            [ -f .env ] || { [ -f .env.example ] && cp .env.example .env; } || true
-
-            if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-              # Compose path
-              sudo docker compose -p "${{ env.PROJECT_NAME }}" down --remove-orphans
-              sudo docker compose -p "${{ env.PROJECT_NAME }}" up -d --build --remove-orphans
-            else
-              # Fallback: single Dockerfile build & run
-              SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-              APP_NAME="${{ secrets.APP_NAME }}"
-              PUB="${{ secrets.PUBLIC_PORT }}"
-              IN="${{ secrets.CONTAINER_PORT }}"
-              [ -n "$APP_NAME" ] && [ -n "$PUB" ] && [ -n "$IN" ] || { echo "Missing APP_NAME/PUBLIC_PORT/CONTAINER_PORT"; exit 1; }
-              sudo docker build -t "$APP_NAME:$SHORT_SHA" -t "$APP_NAME:latest" .
-              sudo docker rm -f "$APP_NAME" 2>/dev/null || true
-              sudo docker run -d --name "$APP_NAME" -p "$PUB:$IN" --restart=always "$APP_NAME:latest"
-            fi
-
-            sudo docker image prune -f
+      - name: Build & start (Docker Compose if present)
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -i ~/.ssh/id_vm -p "${{ secrets.SSH_PORT || 22 }}" -o StrictHostKeyChecking=yes \
+            "$SSH_USER@$SSH_HOST" "
+              set -e
+              if ! command -v docker >/dev/null 2>&1; then
+                curl -fsSL https://get.docker.com | sh
+                sudo systemctl enable --now docker
+              fi
+              if ! docker compose version >/dev/null 2>&1; then
+                sudo apt-get update -y && sudo apt-get install -y docker-compose-plugin
+              fi
+              cd '${APP_DIR}'
+              [ -f .env ] || { [ -f .env.example ] && cp .env.example .env; } || true
+              if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
+                docker compose -p testing down --remove-orphans
+                docker compose -p testing up -d --build --remove-orphans
+              else
+                # fallback single Dockerfile (requires APP_NAME/PUBLIC_PORT/CONTAINER_PORT secrets)
+                SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-7)
+                docker build -t '${{ secrets.APP_NAME }}:'\"$SHORT_SHA\" -t '${{ secrets.APP_NAME }}:latest' .
+                docker rm -f '${{ secrets.APP_NAME }}' 2>/dev/null || true
+                docker run -d --name '${{ secrets.APP_NAME }}' -p '${{ secrets.PUBLIC_PORT }}:${{ secrets.CONTAINER_PORT }}' --restart=always '${{ secrets.APP_NAME }}:latest'
+              fi
+              docker image prune -f
+            "
